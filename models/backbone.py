@@ -88,7 +88,7 @@ class BackboneBase(nn.Module):
         for name, x in xs.items():
             m = tensor_list.mask
             assert m is not None
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0] # 上/下采样
             out[name] = NestedTensor(x, mask)
         return out
 
@@ -122,7 +122,7 @@ class Joiner(nn.Sequential):
         for name, x in sorted(xs.items()):
             out.append(x)
 
-        # position encoding
+        # position encoding，每一层都添加位置编码
         for x in out:
             pos.append(self[1](x).to(x.tensors.dtype))
 

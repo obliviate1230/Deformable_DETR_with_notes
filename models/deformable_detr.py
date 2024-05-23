@@ -48,14 +48,17 @@ class DeformableDETR(nn.Module):
             two_stage: two-stage Deformable DETR
         """
         super().__init__()
-        self.num_queries = num_queries
+        self.num_queries = num_queries # 300
         self.transformer = transformer
-        hidden_dim = transformer.d_model
+        hidden_dim = transformer.d_model # 256
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
+        # one stage是object query
+        # two stage是reference points
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
+        # 3个1x1卷积和1个3x3卷积
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
             input_proj_list = []
@@ -78,11 +81,12 @@ class DeformableDETR(nn.Module):
                     nn.Conv2d(backbone.num_channels[0], hidden_dim, kernel_size=1),
                     nn.GroupNorm(32, hidden_dim),
                 )])
-        self.backbone = backbone
-        self.aux_loss = aux_loss
-        self.with_box_refine = with_box_refine
-        self.two_stage = two_stage
+        self.backbone = backbone # backbone Joiner 0 Backbone 1 PositionEmbeddingSine
+        self.aux_loss = aux_loss # True 计算辅助损失 6个decoder总损失
+        self.with_box_refine = with_box_refine # false 第一个策略
+        self.two_stage = two_stage # false 第二个策略
 
+        # 初始化
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         self.class_embed.bias.data = torch.ones(num_classes) * bias_value
@@ -93,15 +97,23 @@ class DeformableDETR(nn.Module):
             nn.init.constant_(proj[0].bias, 0)
 
         # if two-stage, the last class_embed and bbox_embed is for region proposal generation
+        # two stage 7个预测头 最后一个class_embed 和 bbox_embed 产生 region proposal
+        # one stage 6个预测头
         num_pred = (transformer.decoder.num_layers + 1) if two_stage else transformer.decoder.num_layers
+
+        # iterative bounding box refinement
+        # 对decoder每层都有不同的分类头和回归头 这里使用_get_clones(deepcopy) 则不同分类头和回归头参数不共享
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
+            # 不使用iterative bounding box refinement时self.transformer.decoder.bbox_embed=None
+            # 反之decoder每一层都会预测bbox偏移量 使用这一层bbox偏移量对上一层的预测输出进行矫正
             self.transformer.decoder.bbox_embed = self.bbox_embed
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
+            # 6/7层decoder共享同一个分类头/回归头  共享参数  如果是7层 最后一层就是第一阶段中proposal的预测
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
@@ -128,15 +140,25 @@ class DeformableDETR(nn.Module):
         """
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
+
+        # 经过backbone resnet50  输出三个尺度的特征信息  features list:3  NestedTensor
+        # 0 = mask[bs, W/8, H/8]     tensors[bs, 512, W/8, H/8]
+        # 1 = mask[bs, W/16, H/16]   tensors[bs, 1024, W/16, H/16]
+        # 2 = mask[bs, W/32, H/32]   tensors[bs, 2048, W/32, H/32]
+        # pos: 3个不同尺度的特征对应的3个位置编码(这里一步到位直接生成经过1x1conv降维后的位置编码)
+        # 0: [bs, 256, H/8, W/8]  1: [bs, 256, H/16, W/16]  2: [bs, 256, H/32, W/32]
         features, pos = self.backbone(samples)
 
         srcs = []
         masks = []
+        # 前三个1x1conv + GroupNorm 前向传播
         for l, feat in enumerate(features):
             src, mask = feat.decompose()
             srcs.append(self.input_proj[l](src))
             masks.append(mask)
             assert mask is not None
+
+        # 最后一层特征 -> conv3x3 + GroupNorm 前向传播
         if self.num_feature_levels > len(srcs):
             _len_srcs = len(srcs)
             for l in range(_len_srcs, self.num_feature_levels):
@@ -145,37 +167,56 @@ class DeformableDETR(nn.Module):
                 else:
                     src = self.input_proj[l](srcs[-1])
                 m = samples.mask
+                # 这一层的特征图shape变为原来一半   mask shape也要变为原来一半  [bs, H/32, H/32] -> [bs, H/64, W/64]
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                # 生成这一层的位置编码  [bs, 256, H/64, W/64]
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
                 srcs.append(src)
                 masks.append(mask)
                 pos.append(pos_l)
-
+        # 到了这一步就完成了全部的backbone的前向传播了  最终生成4个不同尺度的特征srcs已经对应的mask和位置编码pos
+        # srcs:  list4  0=[bs,256,H/8,W/8] 1=[bs,256,H/16,W/16] 2=[bs,256,H/32,W/32] 3=[bs,256,H/64,W/64]
+        # masks: list4  0=[bs,H/8,W/8] 1=[bs,H/16,W/16] 2=[bs,H/32,W/32] 3=[bs,H/64,W/64]
+        # pos:   list4  0=[bs,256,H/8,W/8] 1=[bs,256,H/16,W/16] 2=[bs,256,H/32,W/32] 3=[bs,256,H/64,W/64]
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
+        
+        # [one-stage]
+        # query_embeds = [300, 512]
+        # hs: 6层decoder输出 [n_decoder, bs, num_query, d_model] = [6, bs, 300, 256]
+        # init_reference_out: 初始化的参考点归一化中心坐标 [bs, 300, 2]
+        # inter_references: 6层decoder学习到的参考点归一化中心坐标  [6, bs, 300, 2]
+        #                   one-stage=[n_decoder, bs, num_query, 2]  two-stage=[n_decoder, bs, num_query, 4]
+        # enc_outputs_class = enc_outputs_coord_unact = None
+        # [two-stage]
+        # query_embeds = None
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
 
-        outputs_classes = []
-        outputs_coords = []
+        outputs_classes = [] # 分类结果
+        outputs_coords = [] # 回归结果
         for lvl in range(hs.shape[0]):
             if lvl == 0:
+                # [bs, 300, 2] xy
                 reference = init_reference
             else:
                 reference = inter_references[lvl - 1]
+            # 反归一化 因为reference在定义时就sigmoid归一化了
             reference = inverse_sigmoid(reference)
+            # 分类头 1个全连接层 [bs, 300, 256] -> [bs, 300, num_classes]
             outputs_class = self.class_embed[lvl](hs[lvl])
+            # 回归头 3个全连接层 [bs, 300, 256] -> [bs, 300, 4] xywh xy是偏移量
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
                 assert reference.shape[-1] == 2
-                tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid()
+                tmp[..., :2] += reference # 偏移量 + 参考点坐标 -> 最终xy坐标
+            outputs_coord = tmp.sigmoid() # xywh -> 归一化
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
-        outputs_class = torch.stack(outputs_classes)
-        outputs_coord = torch.stack(outputs_coords)
+        outputs_class = torch.stack(outputs_classes) # [6, bs, 300, num_classes]
+        outputs_coord = torch.stack(outputs_coords) # [6, bs, 300, 4]
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
@@ -184,6 +225,9 @@ class DeformableDETR(nn.Module):
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+        # 'pred_logits': 最后一层的分类头输出 [bs, 300, num_classes]
+        # 'pred_boxes': 最后一层的回归头输出 [bs, 300, xywh(归一化)]
+        # 'aux_outputs': 其他中间5层的分类头和输出头
         return out
 
     @torch.jit.unused

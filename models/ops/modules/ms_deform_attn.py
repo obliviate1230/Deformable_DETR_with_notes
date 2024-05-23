@@ -47,26 +47,38 @@ class MSDeformAttn(nn.Module):
 
         self.im2col_step = 64
 
-        self.d_model = d_model
-        self.n_levels = n_levels
-        self.n_heads = n_heads
-        self.n_points = n_points
+        self.d_model = d_model  # 特征层channel 256
+        self.n_levels = n_levels # 多尺度特征 4
+        self.n_heads = n_heads # 多头 8
+        self.n_points = n_points # 采样点个数 4 
 
+        # 采样点的坐标偏移量，每个query在每个head，level上都需要采样n_points个点(x,y) 256=8*4*4*2
         self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+        # 每个query对应的所有采样点的注意力权重 8*4*4=128
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
+        # 线性变换得到value
         self.value_proj = nn.Linear(d_model, d_model)
+        # 最后线性变化得到结果
         self.output_proj = nn.Linear(d_model, d_model)
 
         self._reset_parameters()
 
     def _reset_parameters(self):
+        # 生成初始化的偏置位置 + 注意力权重初始化
         constant_(self.sampling_offsets.weight.data, 0.)
+        # [8, ]  0, pi/4, pi/2, 3pi/4, pi, 5pi/4, 3pi/2, 7pi/4
         thetas = torch.arange(self.n_heads, dtype=torch.float32) * (2.0 * math.pi / self.n_heads)
         grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        # [n_heads, n_levels, n_points, xy] = [8, 4, 4, 2]
         grid_init = (grid_init / grid_init.abs().max(-1, keepdim=True)[0]).view(self.n_heads, 1, 1, 2).repeat(1, self.n_levels, self.n_points, 1)
+        # 同一特征层中不同采样点的坐标偏移肯定不能够一样  因此这里需要处理
+        # 对于第i个采样点，在8个头部和所有特征层中，其坐标偏移为：
+        # (i,0) (i,i) (0,i) (-i,i) (-i,0) (-i,-i) (0,-i) (i,-i)   1<= i <= n_points
+        # 从图形上看，形成的偏移位置相当于3x3正方形卷积核 去除中心 中心是参考点
         for i in range(self.n_points):
             grid_init[:, :, i, :] *= i + 1
         with torch.no_grad():
+            # 把初始化的偏移量的偏置bias设置进去，不计算梯度
             self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
         constant_(self.attention_weights.weight.data, 0.)
         constant_(self.attention_weights.bias.data, 0.)
@@ -86,30 +98,59 @@ class MSDeformAttn(nn.Module):
         :param input_padding_mask          (N, \sum_{l=0}^{L-1} H_l \cdot W_l), True for padding elements, False for non-padding elements
 
         :return output                     (N, Length_{query}, C)
+
+        query: 4个flatten后的特征图+4个flatten后特征图对应的位置编码 = src_flatten + lvl_pos_embed_flatten
+               [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
+        reference_points: 4个flatten后特征图对应的归一化参考点坐标 每个特征点有4个参考点 xy坐标
+                          [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 4, 2]
+        input_flatten: 4个flatten后的特征图=src_flatten  [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
+        input_spatial_shapes: 4个flatten后特征图的shape [4, 2]
+        input_level_start_index: 4个flatten后特征图对应被flatten后的起始索引 [4]  如[0,15100,18900,19850]
+        input_padding_mask: 4个flatten后特征图的mask [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64]
         """
-        N, Len_q, _ = query.shape
+        N, Len_q, _ = query.shape # query length（每张图片所有的特征点数量）
         N, Len_in, _ = input_flatten.shape
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
-
+        # N, Len_in, C=256
+        # 通过线性变换将输入的特征图变成value， [bs, len_q, 256] -> [bs, len_q, 256]
         value = self.value_proj(input_flatten)
+        # 将原图padding的部分用0填充
         if input_padding_mask is not None:
             value = value.masked_fill(input_padding_mask[..., None], float(0))
+        # 拆分成8个head，(bs, Len_in, 8, 64)
         value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
+        # 预测采样点偏移量， (bs, Len_q, 8, 4, 4, 2)
         sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+        # 预测采样点的注意力权重， (bs, Len_q, 8, 4*4)
         attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        # 权重归一化，对4个特征层分别采样的4个特征点，合计16个点，进行归一化
+        # [bs, Len_q, 8, 16] -> [bs, Len_q, 8, 16] -> [bs, Len_q, 8, 4, 4]
         attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
         # N, Len_q, n_heads, n_levels, n_points, 2
         if reference_points.shape[-1] == 2:
+            # （4, 2)，其中每个是w，h
             offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+            # 对坐标偏移量使用对应特征层的宽高进行归一化然后和参考点坐标相加得到采样点坐标
+            # 参考点 + 偏移量/特征层宽高 = 采样点
             sampling_locations = reference_points[:, :, None, :, None, :] \
                                  + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
         elif reference_points.shape[-1] == 4:
+            # 最后一维度是4表示(cx, cy, w, h)
+            # 前两个是xy 后两个是wh
+            # 初始化时offset是在 -n_points ~ n_points 范围之间 这里除以self.n_points是相当于把offset归一化到 0~1
+            # 然后再乘以宽高的一半 再加上参考点的中心坐标 这就相当于使得最后的采样点坐标总是位于proposal box内
+            # 相当于对采样范围进行了约束 减少了搜索空间
             sampling_locations = reference_points[:, :, None, :, None, :2] \
                                  + sampling_offsets / self.n_points * reference_points[:, :, None, :, None, 2:] * 0.5
         else:
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
+        # 将注意力权重与value进行计算
+        # 输入：采样点位置、注意力权重、所有点的value
+        # 具体过程：根据采样点位置从所有点的value中拿出对应的value，并且和对应的注意力权重进行weighted sum
+        # 调用CUDA实现的MSDeformAttnFunction函数
         output = MSDeformAttnFunction.apply(
             value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+        # 做线性变换得到最终结果
         output = self.output_proj(output)
         return output
