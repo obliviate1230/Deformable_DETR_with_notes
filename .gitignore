@@ -1,0 +1,7 @@
+__pycache__
+MAR20
+*.egg-info
+models/ops/build/
+models/ops/dist/
+*.pth
+data/
